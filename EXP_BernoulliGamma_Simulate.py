@@ -6,7 +6,7 @@ max_number_of_simulations = 50
 datafolder = "data/"
 batch_size_simulation = 256
 save_some_stats = True
-
+save_prediction_as_diffusion_background = True
 
 import os
 import importlib
@@ -78,17 +78,11 @@ xxPrTransforms = module_data.XPrTransforms(xx_pr=xx_pr)
 xx1DPrTransforms = module_data.XPrTransforms1D(xx_pr=xx1d_pr)
 yy_pr_Transform = module_data.YPrTransforms(yy_pr=yy_pr)
 
-del(xx_pr)
-del(xx1d_pr)
 
 
 
 
 
-
-
-xx2d_test = torch.Tensor(np.load(datafolder + "x2d_test.npy"))
-xx1d_test = torch.Tensor(np.load(datafolder + "x1d_test.npy"))
 
 
 
@@ -135,6 +129,37 @@ if is_main_process:
 
 
 
+
+
+if save_prediction_as_diffusion_background:
+    xx_pr = xxPrTransforms.transform(xx_pr)
+    xx1d_pr = xx1DPrTransforms.transform(xx1d_pr)
+
+    TensorDataset_train = TensorDataset(xx_pr, xx1d_pr)
+    train_dataloader = DataLoader(TensorDataset_train, batch_size = batch_size_simulation,
+                                shuffle=False, drop_last=False)
+
+    prediction_train = torch.empty((0, 3, pr_shape[-2], pr_shape[-1]), dtype=torch.float32)
+    for batch in train_dataloader:
+        prediction_train = torch.cat([prediction_train, model_pr.predict(batch[0], x_1D = batch[1])], dim=0)
+                
+    np.save(folder_simulations + "/prediction_train.npy", prediction_train.cpu().numpy())
+
+
+
+del(xx_pr)
+del(xx1d_pr)
+del(TensorDataset_train)
+del(train_dataloader)
+del(prediction_train)
+
+
+
+xx2d_test = torch.Tensor(np.load(datafolder + "x2d_test.npy"))
+xx1d_test = torch.Tensor(np.load(datafolder + "x1d_test.npy"))
+
+
+
 xx2d_test = xxPrTransforms.transform(xx2d_test)
 xx1d_test = xx1DPrTransforms.transform(xx1d_test)
 
@@ -149,6 +174,10 @@ for batch in test_dataloader:
     prediction = torch.cat([prediction, model_pr.predict(batch[0], x_1D = batch[1])], dim=0)
             
 
+
+
+if save_prediction_as_diffusion_background:
+    np.save(folder_simulations + "/prediction_test.npy", prediction.cpu().numpy())
 
 
 
@@ -184,8 +213,6 @@ for i in range(1000):
 
 
 np.save(folder_simulations + "/simulations_days.npy", simulations_targets)
-
-
 
 
 

@@ -382,6 +382,10 @@ if is_main_process:
 
     # Recreate the same early-stop split used above
     torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    
+    
     subsample_size = int(fractionLeft4earlystop * yy_pr.shape[0])
     indices = torch.randperm(yy_pr.shape[0])[:subsample_size]
 
@@ -391,11 +395,6 @@ if is_main_process:
 
     stats_for_n_validation_samples = min(stats_for_n_validation_samples, subsample_size)  # Ensure we don't try to plot more samples than available in the early-stop set
 
-    
-    indices = torch.randperm(yy_pr.shape[0])[:subsample_size]
-
-    early_stop_yy = yy_pr[indices]
-    early_stop_xx = xx_pr[indices]
 
     random_day_indices = np.random.choice(early_stop_xx.shape[0], stats_for_n_validation_samples, replace=False)
     random_day_indices_plot = np.random.choice(random_day_indices, min(plot_n_validation_samples, stats_for_n_validation_samples), replace=False)

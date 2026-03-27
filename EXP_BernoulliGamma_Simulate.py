@@ -147,7 +147,7 @@ if save_prediction_as_diffusion_background:
     for batch in train_dataloader:
         prediction_train = torch.cat([prediction_train, model_pr.predict(batch[0], x_1D = batch[1])], dim=0)
                 
-    np.save(folder_simulations + "/prediction_train.npy", prediction_train.cpu().numpy())
+    np.save(folder_final + "/prediction_train.npy", prediction_train.cpu().numpy())
     
     del(TensorDataset_train)
     del(train_dataloader)
@@ -183,7 +183,7 @@ for batch in test_dataloader:
 
 
 if save_prediction_as_diffusion_background:
-    np.save(folder_simulations + "/prediction_test.npy", prediction.cpu().numpy())
+    np.save(folder_final + "/prediction_test.npy", prediction.cpu().numpy())
 
 
 

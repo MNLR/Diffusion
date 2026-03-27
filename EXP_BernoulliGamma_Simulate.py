@@ -129,8 +129,10 @@ model_pr.load_state_dict(final_model_name)
 
 if is_main_process:
     print("Model loaded.", flush=True)
+    folder_to_save_predictions = folder_simulations
+    os.makedirs(folder_to_save_predictions, exist_ok=True)
+    folder_simulations = os.path.join(folder_simulations, "simulations")
     os.makedirs(folder_simulations, exist_ok=True)
-
 
 
 
@@ -147,7 +149,7 @@ if save_prediction_as_diffusion_background:
     for batch in train_dataloader:
         prediction_train = torch.cat([prediction_train, model_pr.predict(batch[0], x_1D = batch[1])], dim=0)
                 
-    np.save(folder_final + "/prediction_train.npy", prediction_train.cpu().numpy())
+    np.save(folder_to_save_predictions + "/prediction_train.npy", prediction_train.cpu().numpy())
     
     del(TensorDataset_train)
     del(train_dataloader)
@@ -183,7 +185,7 @@ for batch in test_dataloader:
 
 
 if save_prediction_as_diffusion_background:
-    np.save(folder_final + "/prediction_test.npy", prediction.cpu().numpy())
+    np.save(folder_to_save_predictions + "/prediction_test.npy", prediction.cpu().numpy())
 
 
 

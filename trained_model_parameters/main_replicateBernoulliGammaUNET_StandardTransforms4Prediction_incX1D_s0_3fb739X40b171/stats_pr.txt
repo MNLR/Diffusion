@@ -1,6 +1,6 @@
 
 Validation summary:
 
-MAE  = 1.5938
-RMSE = 3.4706
+MAE  = 1.6357
+RMSE = 3.4801
 

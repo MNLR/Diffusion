@@ -15,12 +15,14 @@ from torch.distributed import all_reduce, ReduceOp, gather
 
 
 class Model:
+    
+
+            
 
     def __init__(self, model_module: nn.Module,
                  device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                  ddp: bool = False, # if True, the model will be wrapped in DDP, using device as the local rank.
-                 world_size: int = 1,
-                 compile_graph = False
+                 world_size: int = 1                 
                  ):
         
         self.optimizer = None
@@ -41,35 +43,41 @@ class Model:
         self.model = model_module.to(self.device)
         
 
-        if compile_graph:
-            self.model = torch.compile(self.model, backend="inductor", mode="max-autotune", fullgraph=False)   
-        
         
         if self.ddp:
             self.model = DDP(self.model, device_ids = [self.device]) 
             self.bestmodelStateDict = deepcopy( self.model.module.state_dict() )
         else:
             self.bestmodelStateDict = deepcopy( self.model.state_dict() )
-
-
-
-
-    def compile_graph(self, backend="inductor", mode="max-autotune", fullgraph=False):
-        """
-        Compile the underlying model for faster execution.
-        Call this AFTER loading weights (recommended).
-        """
-        if self.ddp:
-            # compile the wrapped module, keep DDP wrapper
-            self.model.module = torch.compile(
-                self.model.module, backend=backend, mode=mode, fullgraph=fullgraph
-            )
-        else:
-            self.model = torch.compile(
-                self.model, backend=backend, mode=mode, fullgraph=fullgraph
-            )
             
             
+            
+    @staticmethod
+    def _validate_training_args(
+        max_epochs,
+        saveModelEvery,
+        write_losses,
+        folder_temp,
+    ):
+        if (
+            isinstance(max_epochs, bool)
+            or not isinstance(max_epochs, (int, np.integer))
+            or max_epochs <= 0
+        ):
+            raise ValueError(
+                "max_epochs must be a positive finite integer."
+            )
+
+        if (
+            (saveModelEvery != torch.inf or write_losses)
+            and folder_temp is None
+        ):
+            raise ValueError(
+                "folder_temp must be set when saving "
+                "checkpoints or losses."
+            )
+            
+
         
     def set_optimizer(self, optimizer, **kwargs):
         if self.optimizer is not None:
@@ -207,12 +215,21 @@ class Model:
                 
 
     def load_state_dict(self, state_dict, last_loss = None, weights_only = True):
+        
+        loaded_state_dict = torch.load(
+            state_dict,
+            weights_only=weights_only,
+            map_location=self.device,
+        )
+        
         if self.ddp:
             # If using DDP, we need to load the state dict into the module
-            self.model.module.load_state_dict(torch.load(state_dict, weights_only = weights_only))  
+            self.model.module.load_state_dict(loaded_state_dict)  
+            self.bestmodelStateDict = deepcopy( self.model.module.state_dict() )
         else:
             # If not using DDP, we can load the state dict directly
-            self.model.load_state_dict( torch.load(state_dict, weights_only = weights_only) )
+            self.model.load_state_dict( loaded_state_dict )
+            self.bestmodelStateDict = deepcopy( self.model.state_dict() )
             
         if last_loss is not None:
             self.bestLoss = last_loss            
@@ -245,23 +262,6 @@ class Model:
                 if verbose:
                     print("Model parameters saved to " + path )
 
-
-
-    def plotComputationGraph(self, file_name = None, format = "png"):
-        # fixme: this currently requires to properly get the shape
-        from torchviz import make_dot
-
-        x = torch.randn(1, *self.model.input_shape).to(self.device)  # Adjust input shape as needed
-        y = self.model(x)
-
-        dot = make_dot(y, params=dict(self.model.named_parameters()))
-        dot.format = format
-
-        if file_name is not None:
-            dot.render(file_name)  # writes pytorch_graph.png
-            print("Computation graph saved to " + file_name + "." + format)
-            
-        return dot
 
 
     def trainModel(self, 
@@ -305,13 +305,13 @@ class Model:
             None
         """       
             
-        if saveModelEvery != torch.inf:
-            if folder_temp is None:
-                raise ValueError("If saveModelEvery is set to not inf, folder_temp must be set.")
-            
-        if max_epochs == torch.inf and patience == torch.inf:
-            raise ValueError("Are you sure you want to train till the end of the universe?")
-        
+        self._validate_training_args(
+            max_epochs,
+            saveModelEvery,
+            write_losses,
+            folder_temp,
+        )
+                
         
         if self.trained:
             if verbose:
@@ -452,7 +452,12 @@ class Model:
 
 
         self.trained = True
-
+        
+        
+        if self.ddp:
+            self.model.module.load_state_dict( self.bestmodelStateDict )
+        else:
+            self.model.load_state_dict( self.bestmodelStateDict )
 
         self.losses = self.losses[:, :epoch ]
         
@@ -605,12 +610,13 @@ class Model:
         """                     
             
             
-        if saveModelEvery != torch.inf:
-            if folder_temp is None:
-                raise ValueError("If saveModelEvery is set to not inf, folder_temp must be set.")
-            
-        if max_epochs == torch.inf and patience == torch.inf:
-            raise ValueError("Are you sure you want to train till the end of the universe?")
+        self._validate_training_args(
+            max_epochs,
+            saveModelEvery,
+            write_losses,
+            folder_temp,
+        )
+        
         
         
         if self.trained:
@@ -757,6 +763,10 @@ class Model:
 
 
         self.trained = True
+        if self.ddp:
+            self.model.module.load_state_dict( self.bestmodelStateDict )
+        else:
+            self.model.load_state_dict( self.bestmodelStateDict )
 
 
         self.losses = self.losses[:, :epoch ]

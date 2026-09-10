@@ -8,10 +8,8 @@ import numpy as np
 import inspect
 
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from torch.distributed import all_reduce, ReduceOp, gather
-
-# fixme an easy fix for running this seamlessly on cpus is use self.device <= 0 instead of self.device == 0
-# since -1 I think its the cpu
 
 
 class Model:
@@ -21,15 +19,45 @@ class Model:
 
     def __init__(self, model_module: nn.Module,
                  device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                 ddp: bool = False, # if True, the model will be wrapped in DDP, using device as the local rank.
+                 ddp: bool = False, # If True, wrap the model in DDP.
                  world_size: int = 1                 
                  ):
         
         self.optimizer = None
         self.scheduler = None
-        self.ddp = ( ddp and (world_size > 1) )
-        self.device = device
-        self.world_size = world_size
+
+        distributed_is_initialized = (
+            dist.is_available() and dist.is_initialized()
+        )
+        self.rank = dist.get_rank() if distributed_is_initialized else 0
+        self.world_size = (
+            dist.get_world_size() if distributed_is_initialized else world_size
+        )
+        self.is_main_process = self.rank == 0
+        self.ddp = bool(ddp and self.world_size > 1)
+
+        if self.ddp and not distributed_is_initialized:
+            raise RuntimeError(
+                "DDP requires an initialized torch.distributed process group."
+            )
+
+        if isinstance(device, int):
+            if device < 0 or not torch.cuda.is_available():
+                self.device = torch.device("cpu")
+            else:
+                self.device = torch.device("cuda", device)
+        else:
+            self.device = torch.device(device)
+            if self.device.type == "cuda":
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        f"CUDA device {self.device} was requested, but CUDA is unavailable."
+                    )
+                if self.device.index is None:
+                    self.device = torch.device(
+                        "cuda", torch.cuda.current_device()
+                    )
+
         self.bestLoss = torch.inf
         self.losses = None
         self.lossesTest = None
@@ -45,7 +73,14 @@ class Model:
 
         
         if self.ddp:
-            self.model = DDP(self.model, device_ids = [self.device]) 
+            if self.device.type == "cuda":
+                self.model = DDP(
+                    self.model,
+                    device_ids=[self.device.index],
+                    output_device=self.device.index,
+                )
+            else:
+                self.model = DDP(self.model)
             self.bestmodelStateDict = deepcopy( self.model.module.state_dict() )
         else:
             self.bestmodelStateDict = deepcopy( self.model.state_dict() )
@@ -77,6 +112,10 @@ class Model:
                 "checkpoints or losses."
             )
             
+
+    def _model_module(self):
+        return self.model.module if self.ddp else self.model
+
 
         
     def set_optimizer(self, optimizer, **kwargs):
@@ -128,11 +167,18 @@ class Model:
     
     
     
-    def test_iter(self, x, y, loss_function, 
-                  verbose = True, **forward_kwargs) -> torch.Tensor:
-        training_mode = self.model.training
+    def _test_iter_with_model(
+        self,
+        model,
+        x,
+        y,
+        loss_function,
+        verbose=True,
+        **forward_kwargs,
+    ) -> torch.Tensor:
+        training_mode = model.training
         if training_mode:
-           self.model = self.model.eval() 
+            model.eval()
         
         x = x.to(self.device)
         for key in forward_kwargs:
@@ -143,17 +189,29 @@ class Model:
 
         
         with torch.no_grad():
-            output = self.model(x, **forward_kwargs)
+            output = model(x, **forward_kwargs)
             loss = loss_function(y, output)
                                 
         if verbose:
             print(f"Loss Test (acc): {loss}")                                
             
             
-        self.model = self.model.train(mode = training_mode)
+        model.train(mode=training_mode)
         
     
         return loss.item()
+
+
+    def test_iter(self, x, y, loss_function,
+                  verbose = True, **forward_kwargs) -> torch.Tensor:
+        return self._test_iter_with_model(
+            self.model,
+            x,
+            y,
+            loss_function,
+            verbose=verbose,
+            **forward_kwargs,
+        )
     
     
     
@@ -203,12 +261,12 @@ class Model:
         if (self.scheduler is not None):
             last_lr = self.scheduler.get_last_lr()
             self.scheduler.step(loss)
-            if verbose and self.device == 0:
+            if verbose and self.is_main_process:
                 if last_lr != self.scheduler.get_last_lr():
                     print(f"Scheduler changed LR from {last_lr} to {self.scheduler.get_last_lr()}")
         
         else:
-            if verbose:
+            if verbose and self.is_main_process:
                 print("Scheduler not set. Ignoring scheduler step.")
                 
                 
@@ -239,28 +297,18 @@ class Model:
     
     
     def save_state_dict(self, path, best = True, verbose = True):
-        # Only save on rank 0 in DDP
-        if self.ddp:
-            if self.device == 0:
-                if best:
-                    torch.save(self.bestmodelStateDict, path)
-                    if verbose:
-                        print("Model parameters saved to " + path )
-                else:
-                    torch.save(self.model.module.state_dict(), path)
-                    if verbose:
-                        print("Model parameters saved to " + path )
-            else:
-                pass
-        else:   
-            if best:
-                torch.save(self.bestmodelStateDict, path)
-                if verbose:
-                    print("Model parameters saved to " + path )
-            else:
-                torch.save(self.model.state_dict(), path)
-                if verbose:
-                    print("Model parameters saved to " + path )
+        # In a distributed process group, only rank 0 writes shared files.
+        if not self.is_main_process:
+            return
+
+        if best:
+            state_dict = self.bestmodelStateDict
+        else:
+            state_dict = self._model_module().state_dict()
+
+        torch.save(state_dict, path)
+        if verbose:
+            print("Model parameters saved to " + path )
 
 
 
@@ -314,7 +362,7 @@ class Model:
                 
         
         if self.trained:
-            if verbose:
+            if verbose and self.is_main_process:
                 print("Model has already been trained or loaded.")
                 if self.losses == None:
                     print("Restarting losses and lossesTest tensors.")
@@ -337,9 +385,10 @@ class Model:
 
 
         
-        print("Starting training on " + str(self.device) + " with " + str(self.world_size) + " processes.")
-        if self.ddp:
-            print(f"DDP is enabled")
+        if verbose and self.is_main_process:
+            print("Starting training on " + str(self.device) + " with " + str(self.world_size) + " processes.")
+            if self.ddp:
+                print("DDP is enabled")
             
             
             
@@ -350,7 +399,7 @@ class Model:
 
         while (epoch < max_epochs) and (patienceCounter < patience):
             
-            if verbose:
+            if verbose and self.is_main_process:
                 print("\n-----------------")
                 
 
@@ -373,7 +422,10 @@ class Model:
                 train_dataloader.sampler.set_epoch(epoch)  # Ensure shuffling is consistent across epochs
             
             
-            progress_bar = tqdm( train_dataloader, disable = (self.device > 0) )
+            progress_bar = tqdm(
+                train_dataloader,
+                disable=not self.is_main_process,
+            )
             for batch in progress_bar:
                 if self.ddp:      
                     progress_bar.set_description(f"Running epoch {epoch} on {self.world_size} GPUs")
@@ -427,7 +479,7 @@ class Model:
             self.updateBestModelandLoss(loss_to_account) # already checks if loss is better than bestLoss and updates bestLoss
 
 
-            if verbose:    
+            if verbose and self.is_main_process:
                 # print("Patience: " + str(patienceCounter) + "/" + str(patience))
                 print("GPU " + str(self.device) + ", Patience: " + str(patienceCounter) + "/" + str(patience))
                 elapsedTime = time.time() - start 
@@ -440,7 +492,7 @@ class Model:
                                     best = True, 
                                     verbose = verbose)
 
-            if write_losses and ( (not self.ddp) or self.device == 0 ):
+            if write_losses and self.is_main_process:
                 np.save(folder_temp + "/losses.npy", self.losses.to("cpu").numpy())
                 
                 if earlyStop_dataloader is not None:
@@ -466,7 +518,7 @@ class Model:
         
         
         
-        if verbose:
+        if verbose and self.is_main_process:
             print("\n \n")
             print("Training finished after " + str(epoch) + " epochs.")
             print("Total training time: " + str(datetime.timedelta(seconds = sumTime)))
@@ -489,68 +541,107 @@ class Model:
 
 
     def __validate(self, my_loss, earlyStop_dataloader, epoch):
-        
-        # if self.device == 0: # Only rank 0 will perform validation                    
-        # fixme: in its current form, each gpu is validating the entire dataset, which is not ideal.
-        # this should be done on just 1 gpu, and then signaled to the other gpus.
-        
-        i_for_the_averaging = 0
-        self.lossesTest[epoch] = 0
-        for batch in earlyStop_dataloader: 
-            x2d_early_stop_b = batch[0]
-            y_early_stop_b = batch[-1]
-            extra = batch[1:-1]
-            if len(extra) != 0:
-                forward_kwargs = { k: v for k, v in zip(self.additional_forward_args, extra) }
-            else:
-                forward_kwargs = {}
-                    
-            self.lossesTest[epoch] += self.test_iter(x2d_early_stop_b,
-                                                    y = y_early_stop_b, 
-                                                    loss_function = my_loss, 
-                                                    verbose = False,
-                                                    **forward_kwargs)                
+        if len(earlyStop_dataloader) == 0:
+            raise ValueError("earlyStop_dataloader is empty.")
 
-            i_for_the_averaging += 1
-                
-        self.lossesTest[epoch] /= i_for_the_averaging
+        validation_loss = 0.0
+
+        if not self.ddp or self.is_main_process:
+            validation_model = self._model_module()
+
+            for batch in earlyStop_dataloader:
+                x2d_early_stop_b = batch[0]
+                y_early_stop_b = batch[-1]
+                extra = batch[1:-1]
+                if len(extra) != 0:
+                    forward_kwargs = {
+                        k: v
+                        for k, v in zip(self.additional_forward_args, extra)
+                    }
+                else:
+                    forward_kwargs = {}
+
+                validation_loss += self._test_iter_with_model(
+                    validation_model,
+                    x2d_early_stop_b,
+                    y=y_early_stop_b,
+                    loss_function=my_loss,
+                    verbose=False,
+                    **forward_kwargs,
+                )
+
+            validation_loss /= len(earlyStop_dataloader)
+
+        if self.ddp:
+            validation_loss_tensor = torch.tensor(
+                validation_loss,
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.broadcast(validation_loss_tensor, src=0)
+            validation_loss = validation_loss_tensor.item()
+
+        self.lossesTest[epoch] = validation_loss
 
 
 
 
     def __validateDiffusion(self, my_loss, earlyStop_dataloader, noise_scheduler, epoch):
+        if len(earlyStop_dataloader) == 0:
+            raise ValueError("earlyStop_dataloader is empty.")
 
-        # if self.device == 0: # Only rank 0 will perform validation
-        # fixme: in its current form, each gpu is validating the entire dataset, which is not ideal.
-        # this should be done on just 1 gpu, and then signaled to the other gpus.
-        
-        i_for_the_averaging = 0
-        self.lossesTest[epoch] = 0
-        for clean_images, condition in earlyStop_dataloader: 
-            noise = torch.randn( clean_images.shape )
-            timesteps = torch.randint( low = 0, high = noise_scheduler.config['num_train_timesteps'], 
-                                      size = (clean_images.shape[0], ), dtype=torch.long)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-            
-            # Conditional path based on model input
-            if "encoder_hidden_states" in self.additional_forward_args:
-                noisy_images_and_condition = noisy_images
-                forward_kwargs = {"encoder_hidden_states": condition}
-            else:
-                noisy_images_and_condition = torch.cat((noisy_images, condition), dim = 1)
-                forward_kwargs = {}
-                
+        validation_loss = 0.0
 
-            self.lossesTest[epoch] += self.test_iter(noisy_images_and_condition,
-                                                     y = noise, 
-                                                     loss_function = my_loss, 
-                                                     verbose = False,
-                                                     timestep = timesteps,
-                                                     **forward_kwargs)                
+        if not self.ddp or self.is_main_process:
+            validation_model = self._model_module()
 
-            i_for_the_averaging += 1
-                
-        self.lossesTest[epoch] /= i_for_the_averaging
+            for clean_images, condition in earlyStop_dataloader:
+                noise = torch.randn(clean_images.shape)
+                timesteps = torch.randint(
+                    low=0,
+                    high=noise_scheduler.config['num_train_timesteps'],
+                    size=(clean_images.shape[0],),
+                    dtype=torch.long,
+                )
+                noisy_images = noise_scheduler.add_noise(
+                    clean_images,
+                    noise,
+                    timesteps,
+                )
+
+                # Conditional path based on model input
+                if "encoder_hidden_states" in self.additional_forward_args:
+                    noisy_images_and_condition = noisy_images
+                    forward_kwargs = {"encoder_hidden_states": condition}
+                else:
+                    noisy_images_and_condition = torch.cat(
+                        (noisy_images, condition),
+                        dim=1,
+                    )
+                    forward_kwargs = {}
+
+                validation_loss += self._test_iter_with_model(
+                    validation_model,
+                    noisy_images_and_condition,
+                    y=noise,
+                    loss_function=my_loss,
+                    verbose=False,
+                    timestep=timesteps,
+                    **forward_kwargs,
+                )
+
+            validation_loss /= len(earlyStop_dataloader)
+
+        if self.ddp:
+            validation_loss_tensor = torch.tensor(
+                validation_loss,
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.broadcast(validation_loss_tensor, src=0)
+            validation_loss = validation_loss_tensor.item()
+
+        self.lossesTest[epoch] = validation_loss
 
 
 
@@ -620,7 +711,7 @@ class Model:
         
         
         if self.trained:
-            if verbose:
+            if verbose and self.is_main_process:
                 print("Model has already been trained or loaded.")
                 if self.losses == None:
                     print("Restarting losses and lossesTest tensors.")
@@ -644,9 +735,10 @@ class Model:
             
             
             
-        print("Starting training on " + str(self.device) + " with " + str(self.world_size) + " processes.")
-        if self.ddp:
-            print(f"DDP is enabled")
+        if verbose and self.is_main_process:
+            print("Starting training on " + str(self.device) + " with " + str(self.world_size) + " processes.")
+            if self.ddp:
+                print("DDP is enabled")
             
             
             
@@ -657,7 +749,7 @@ class Model:
 
         while (epoch < max_epochs) and (patienceCounter < patience):
             
-            if verbose:
+            if verbose and self.is_main_process:
                 print("\n-----------------")
                 
 
@@ -679,7 +771,10 @@ class Model:
             
             
             batch_i = 0
-            progress_bar = tqdm( train_dataloader, disable = (self.device > 0) )
+            progress_bar = tqdm(
+                train_dataloader,
+                disable=not self.is_main_process,
+            )
             for clean_images, condition in progress_bar:          
 
                 noise = torch.randn( clean_images.shape )
@@ -722,7 +817,7 @@ class Model:
                     loss_to_account = loss_to_account.to(self.device)
                     all_reduce(loss_to_account, op=ReduceOp.AVG)
                     self.losses[:, epoch] = loss_to_account.cpu()
-            else: # note: as of now, all gpus will perform the same validation. This is quick and probably fine since communication *may* be slower
+            else:
                 self.__validateDiffusion(my_loss_function, earlyStop_dataloader, noise_scheduler, epoch) # updates self.lossesTest[epoch]
                 loss_to_account = self.lossesTest[epoch]
             
@@ -741,7 +836,7 @@ class Model:
             self.updateBestModelandLoss(loss_to_account) # already checks if loss is better than bestLoss and updates bestLoss
 
 
-            if verbose:    
+            if verbose and self.is_main_process:
                 # print("Patience: " + str(patienceCounter) + "/" + str(patience))
                 print("GPU " + str(self.device) + ", Patience: " + str(patienceCounter) + "/" + str(patience))
                 elapsedTime = time.time() - start 
@@ -754,7 +849,7 @@ class Model:
                                     best = True, 
                                     verbose = verbose)
 
-            if write_losses and ( (not self.ddp) or self.device == 0 ):  # fixme this is just the losses for one device. change losses to loss_to_account
+            if write_losses and self.is_main_process:  # fixme this is just the losses for one device. change losses to loss_to_account
                 np.save(folder_temp + "/losses.npy", self.losses.to("cpu").numpy())
                 
                 
@@ -775,7 +870,7 @@ class Model:
                 
         
         
-        if verbose:
+        if verbose and self.is_main_process:
             print("\n \n")
             print("Training finished after " + str(epoch) + " epochs.")
             print("Total training time: " + str(datetime.timedelta(seconds = sumTime)))
@@ -833,9 +928,8 @@ class Model:
                 print("Warning: no index was found and this seems to be a distributed simulation. It will not be possible to remove potential duplicates and beware of the order.")
         
         
-        if verbose:
-            if self.device == 0:
-                print("Simulating on " + str(self.world_size) + " devices")
+        if verbose and self.is_main_process:
+            print("Simulating on " + str(self.world_size) + " devices")
 
         uses_subdataloader = False
         if sub_batch_size is not None:
@@ -848,7 +942,10 @@ class Model:
             progress_bar = dataloader  
         else:
             if verbose: 
-                progress_bar = tqdm(dataloader, disable = (self.device > 0))  
+                progress_bar = tqdm(
+                    dataloader,
+                    disable=not self.is_main_process,
+                )
             else:
                 progress_bar = dataloader
 
@@ -872,7 +969,7 @@ class Model:
                     sub_dataloader = tqdm(torch.utils.data.DataLoader( torch.utils.data.TensorDataset(sample, conditioning),
                                                                     batch_size = sub_batch_size,
                                                                     shuffle = False), 
-                                        disable = (self.device > 0)
+                                        disable=not self.is_main_process
                                         )
                 else:
                     sub_dataloader = torch.utils.data.DataLoader( torch.utils.data.TensorDataset(sample, conditioning),
@@ -927,15 +1024,15 @@ class Model:
         if self.world_size > 1:
             # Gather the simulation results from all devices
             # Note: This assumes that the simulation is on the CPU, so necessitates backend = "gloo"
-            simulations_on_all_devices = [torch.zeros(size = simulation.shape) for _ in range(self.world_size)] if self.device == 0 else None                
+            simulations_on_all_devices = [torch.zeros(size = simulation.shape) for _ in range(self.world_size)] if self.is_main_process else None
             gather(simulation, simulations_on_all_devices, dst = 0)
             
             if has_indexing:
-                indices_on_all_devices = [torch.zeros(size = index.shape) for _ in range(self.world_size)] if self.device == 0 else None
+                indices_on_all_devices = [torch.zeros(size = index.shape) for _ in range(self.world_size)] if self.is_main_process else None
                 gather(index, indices_on_all_devices, dst = 0)
         
         
-        if self.device == 0:
+        if self.is_main_process:
             if self.world_size > 1:            
                 simulation = torch.cat(simulations_on_all_devices, dim=0)
                 if has_indexing:

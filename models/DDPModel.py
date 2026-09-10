@@ -9,7 +9,7 @@ import inspect
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torch.distributed import all_reduce, ReduceOp, gather
+from torch.distributed import ReduceOp, gather
 
 
 class Model:
@@ -60,6 +60,7 @@ class Model:
 
         self.bestLoss = torch.inf
         self.losses = None
+        self.lossesEpoch = None
         self.lossesTest = None
         self.trained = False
 
@@ -115,6 +116,26 @@ class Model:
 
     def _model_module(self):
         return self.model.module if self.ddp else self.model
+
+    def _load_model_state_dict(self, state_dict):
+        """Restore in-memory weights without changing checkpoint metadata."""
+        self._model_module().load_state_dict(state_dict)
+
+    def _epoch_loss(self, loss_sum, sample_count):
+        """Global sample-weighted mean of scalar batch-mean losses.
+
+        Loss functions must return a mean over samples (and, for fixed-size
+        fields, their elements). Counts refer to samples actually processed,
+        including any padding introduced by a distributed sampler.
+        """
+        totals = torch.tensor(
+            [loss_sum, sample_count], device=self.device, dtype=torch.float64
+        )
+        if self.ddp:
+            dist.all_reduce(totals, op=ReduceOp.SUM)
+        if totals[1].item() == 0:
+            raise ValueError("train_dataloader is empty.")
+        return (totals[0] / totals[1]).item()
 
 
         
@@ -244,13 +265,7 @@ class Model:
     def updateBestModelandLoss(self, loss):
         
         if loss < self.bestLoss:
-            if self.ddp:
-                # If using DDP, we need to get the state dict from the module
-                self.bestmodelStateDict = deepcopy(self.model.module.state_dict())
-            else:
-                # If not using DDP, we can directly access the state dict
-                # Note: deepcopy is used to ensure we don't modify the original state dict
-                self.bestmodelStateDict = deepcopy(self.model.state_dict())
+            self.bestmodelStateDict = deepcopy(self._model_module().state_dict())
             
             self.bestLoss = loss
         
@@ -280,14 +295,8 @@ class Model:
             map_location=self.device,
         )
         
-        if self.ddp:
-            # If using DDP, we need to load the state dict into the module
-            self.model.module.load_state_dict(loaded_state_dict)  
-            self.bestmodelStateDict = deepcopy( self.model.module.state_dict() )
-        else:
-            # If not using DDP, we can load the state dict directly
-            self.model.load_state_dict( loaded_state_dict )
-            self.bestmodelStateDict = deepcopy( self.model.state_dict() )
+        self._load_model_state_dict(loaded_state_dict)
+        self.bestmodelStateDict = deepcopy(self._model_module().state_dict())
             
         if last_loss is not None:
             self.bestLoss = last_loss            
@@ -326,7 +335,10 @@ class Model:
         Trains the model using the provided training and early stopping dataloaders, with support for early stopping, 
         learning rate scheduling, and periodic model checkpointing.
         Args:
-            my_loss (callable): The loss function to use for training and validation. Format: loss_function(y, output)
+            my_loss (callable): Scalar batch-mean loss_function(y, output).
+                Epoch metrics weight each batch by its sample count.
+                Sum-reduced or variable-denominator masked losses must be
+                normalized to a per-sample mean by the caller.
             train_dataloader (torch.utils.data.DataLoader): DataLoader for the training dataset. Must contain at least two tensors in each batch:
                 - [0]: input
                 - [-1]: target tensor (e.g. labels or ground truth)
@@ -344,7 +356,10 @@ class Model:
             ValueError: If saveModelEvery is not torch.inf and folder_temp is not provided.
             ValueError: If both max_epochs and patience are set to torch.inf.
         Side Effects:
-            - Updates self.losses and self.lossesTest with training and validation losses.
+            - self.losses retains rank-local batch losses; self.lossesEpoch
+              contains sample-weighted global training means. self.lossesTest
+              contains sample-weighted validation means from rank 0's loader.
+              DDP validation requires the full, unsharded validation loader.
             - Updates self.bestLoss and self.bestmodelStateDict with the best validation loss and corresponding model parameters.
             - Saves model checkpoints and loss arrays to disk if enabled.
             - Prints progress and status messages if verbose is True.
@@ -376,6 +391,8 @@ class Model:
         
         self.losses = torch.zeros((len(train_dataloader), max_epochs)) 
         self.losses[self.losses == 0] = torch.nan
+        self.lossesEpoch = torch.full((max_epochs,), torch.nan, dtype=torch.float64)
+        self.lossesTest = None
         
         if earlyStop_dataloader is None:
             pass
@@ -406,16 +423,18 @@ class Model:
                 print("GPU " + str(self.device) + ", Epoch: " + str(epoch) + "/" + str(max_epochs) + " @ " + str(datetime.datetime.now()) + "(+" + str(elapsedTime) + "s)")
                 print("Current learning rate is: " + str(self.optimizer.param_groups[0]['lr']))
                 if epoch > 0:
-                    print(f"Train Loss: {self.losses[:, epoch-1].mean()}")
+                    print(f"Train Loss: {self.lossesEpoch[epoch-1]}")
                     if earlyStop_dataloader is not None:
                         print(f"Validation current loss: {self.lossesTest[epoch-1]} / Best loss : {self.bestLoss}")
                     else:
-                        print(f"Current loss: {self.losses[:, epoch-1].mean()} / Best loss : {self.bestLoss}")
+                        print(f"Current loss: {self.lossesEpoch[epoch-1]} / Best loss : {self.bestLoss}")
                         
                 start = time.time()
                 
             
             batch_i = 0
+            epoch_loss_sum = 0.0
+            epoch_sample_count = 0
             
             
             if self.ddp:
@@ -448,17 +467,16 @@ class Model:
                                        **forward_kwargs)
                 
                 self.losses[batch_i, epoch] = loss
+                epoch_loss_sum += loss * x.shape[0]
+                epoch_sample_count += x.shape[0]
                                 
                 batch_i += 1
                 
 
 
+            self.lossesEpoch[epoch] = self._epoch_loss(epoch_loss_sum, epoch_sample_count)
             if earlyStop_dataloader is None:
-                loss_to_account = self.losses[:, epoch].mean()      
-                if self.world_size > 1:
-                    loss_to_account = loss_to_account.to(self.device)
-                    all_reduce(loss_to_account, op=ReduceOp.AVG)
-                    self.losses[:, epoch] = loss_to_account.cpu()
+                loss_to_account = self.lossesEpoch[epoch]
             else:
                 self.__validate(my_loss_function, earlyStop_dataloader, epoch) # updates self.lossesTest[epoch]
                 loss_to_account = self.lossesTest[epoch]
@@ -494,6 +512,7 @@ class Model:
 
             if write_losses and self.is_main_process:
                 np.save(folder_temp + "/losses.npy", self.losses.to("cpu").numpy())
+                np.save(folder_temp + "/lossesEpoch.npy", self.lossesEpoch.numpy())
                 
                 if earlyStop_dataloader is not None:
                     np.save(folder_temp + "/lossesTest.npy", self.lossesTest.to("cpu").numpy()) 
@@ -506,12 +525,10 @@ class Model:
         self.trained = True
         
         
-        if self.ddp:
-            self.model.module.load_state_dict( self.bestmodelStateDict )
-        else:
-            self.model.load_state_dict( self.bestmodelStateDict )
+        self._load_model_state_dict(self.bestmodelStateDict)
 
         self.losses = self.losses[:, :epoch ]
+        self.lossesEpoch = self.lossesEpoch[:epoch]
         
         if earlyStop_dataloader is not None:        
             self.lossesTest = self.lossesTest[ :epoch ]
@@ -545,6 +562,7 @@ class Model:
             raise ValueError("earlyStop_dataloader is empty.")
 
         validation_loss = 0.0
+        validation_sample_count = 0
 
         if not self.ddp or self.is_main_process:
             validation_model = self._model_module()
@@ -561,7 +579,7 @@ class Model:
                 else:
                     forward_kwargs = {}
 
-                validation_loss += self._test_iter_with_model(
+                batch_loss = self._test_iter_with_model(
                     validation_model,
                     x2d_early_stop_b,
                     y=y_early_stop_b,
@@ -570,7 +588,11 @@ class Model:
                     **forward_kwargs,
                 )
 
-            validation_loss /= len(earlyStop_dataloader)
+                batch_size = x2d_early_stop_b.shape[0]
+                validation_loss += batch_loss * batch_size
+                validation_sample_count += batch_size
+
+            validation_loss /= validation_sample_count
 
         if self.ddp:
             validation_loss_tensor = torch.tensor(
@@ -591,6 +613,7 @@ class Model:
             raise ValueError("earlyStop_dataloader is empty.")
 
         validation_loss = 0.0
+        validation_sample_count = 0
 
         if not self.ddp or self.is_main_process:
             validation_model = self._model_module()
@@ -620,7 +643,7 @@ class Model:
                     )
                     forward_kwargs = {}
 
-                validation_loss += self._test_iter_with_model(
+                batch_loss = self._test_iter_with_model(
                     validation_model,
                     noisy_images_and_condition,
                     y=noise,
@@ -630,7 +653,11 @@ class Model:
                     **forward_kwargs,
                 )
 
-            validation_loss /= len(earlyStop_dataloader)
+                batch_size = clean_images.shape[0]
+                validation_loss += batch_loss * batch_size
+                validation_sample_count += batch_size
+
+            validation_loss /= validation_sample_count
 
         if self.ddp:
             validation_loss_tensor = torch.tensor(
@@ -680,6 +707,9 @@ class Model:
             train_dataloader (torch.utils.data.DataLoader): DataLoader for the training dataset. Must contain two tensors in each batch:
                 - [0]: target (clean images)
                 - [1]: conditioning            
+            my_loss_function (callable): Scalar batch-mean loss. Epoch metrics
+                weight batches by sample count; sum-reduced or variable-denominator
+                masked losses require caller normalization to a per-sample mean.
             max_epochs (int, optional): Maximum number of epochs to train. Defaults to 1000.
             patience (int, optional): Number of epochs to wait for improvement in validation loss before stopping early. Defaults to 50.
             saveModelEvery (int or float, optional): Frequency (in epochs) to save model checkpoints. If set to torch.inf, disables periodic saving. Defaults to torch.inf.
@@ -691,7 +721,10 @@ class Model:
             ValueError: If saveModelEvery is not torch.inf and folder_temp is not provided.
             ValueError: If both max_epochs and patience are set to torch.inf.
         Side Effects:
-            - Updates self.losses and self.lossesTest with training and validation losses.
+            - self.losses retains rank-local batch losses; self.lossesEpoch
+              contains sample-weighted global training means. self.lossesTest
+              contains sample-weighted validation means from rank 0's loader.
+              DDP validation requires the full, unsharded validation loader.
             - Updates self.bestLoss and self.bestmodelStateDict with the best validation loss and corresponding model parameters.
             - Saves model checkpoints and loss arrays to disk if enabled.
             - Prints progress and status messages if verbose is True.
@@ -726,6 +759,8 @@ class Model:
         
         self.losses = torch.zeros((len(train_dataloader), max_epochs)) 
         self.losses[self.losses == 0] = torch.nan
+        self.lossesEpoch = torch.full((max_epochs,), torch.nan, dtype=torch.float64)
+        self.lossesTest = None
         
         if earlyStop_dataloader is None:
             pass
@@ -757,10 +792,10 @@ class Model:
                 print("Current learning rate is: " + str(self.optimizer.param_groups[0]['lr']))
                 if epoch > 0:
                     if earlyStop_dataloader is not None:
-                        print(f"Train Loss: {self.losses[:, epoch-1].mean()}")
+                        print(f"Train Loss: {self.lossesEpoch[epoch-1]}")
                         print(f"Validation current loss: {self.lossesTest[epoch-1]} / Best loss : {self.bestLoss}")
                     else:
-                        print(f"Train current loss: {self.losses[:, epoch-1].mean()} / Best loss: {self.bestLoss}")
+                        print(f"Train current loss: {self.lossesEpoch[epoch-1]} / Best loss: {self.bestLoss}")
                 start = time.time()
                 
 
@@ -771,6 +806,8 @@ class Model:
             
             
             batch_i = 0
+            epoch_loss_sum = 0.0
+            epoch_sample_count = 0
             progress_bar = tqdm(
                 train_dataloader,
                 disable=not self.is_main_process,
@@ -794,12 +831,15 @@ class Model:
                     forward_kwargs = {}
 
                 
-                self.losses[batch_i, epoch] = self.train_iter(x = noisy_images_and_condition,
+                loss = self.train_iter(x = noisy_images_and_condition,
                                                               y = noise, 
                                                               timestep = timesteps,
                                                               loss_function = my_loss_function,
                                                               **forward_kwargs
                                                               )
+                self.losses[batch_i, epoch] = loss
+                epoch_loss_sum += loss * clean_images.shape[0]
+                epoch_sample_count += clean_images.shape[0]
 
                 if self.ddp:      
                     progress_bar.set_description(f"Running epoch {epoch} on {self.world_size} GPUs. Current Loss: {self.losses[batch_i, epoch]}")
@@ -811,12 +851,9 @@ class Model:
                                        
 
             
+            self.lossesEpoch[epoch] = self._epoch_loss(epoch_loss_sum, epoch_sample_count)
             if earlyStop_dataloader is None:
-                loss_to_account = self.losses[:, epoch].mean()
-                if self.world_size > 1:
-                    loss_to_account = loss_to_account.to(self.device)
-                    all_reduce(loss_to_account, op=ReduceOp.AVG)
-                    self.losses[:, epoch] = loss_to_account.cpu()
+                loss_to_account = self.lossesEpoch[epoch]
             else:
                 self.__validateDiffusion(my_loss_function, earlyStop_dataloader, noise_scheduler, epoch) # updates self.lossesTest[epoch]
                 loss_to_account = self.lossesTest[epoch]
@@ -849,8 +886,11 @@ class Model:
                                     best = True, 
                                     verbose = verbose)
 
-            if write_losses and self.is_main_process:  # fixme this is just the losses for one device. change losses to loss_to_account
+            if write_losses and self.is_main_process:
                 np.save(folder_temp + "/losses.npy", self.losses.to("cpu").numpy())
+                np.save(folder_temp + "/lossesEpoch.npy", self.lossesEpoch.numpy())
+                if earlyStop_dataloader is not None:
+                    np.save(folder_temp + "/lossesTest.npy", self.lossesTest.numpy())
                 
                 
                 
@@ -858,13 +898,11 @@ class Model:
 
 
         self.trained = True
-        if self.ddp:
-            self.model.module.load_state_dict( self.bestmodelStateDict )
-        else:
-            self.model.load_state_dict( self.bestmodelStateDict )
+        self._load_model_state_dict(self.bestmodelStateDict)
 
 
         self.losses = self.losses[:, :epoch ]
+        self.lossesEpoch = self.lossesEpoch[:epoch]
         if earlyStop_dataloader is not None:        
             self.lossesTest = self.lossesTest[ :epoch ]
                 

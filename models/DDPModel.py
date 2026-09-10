@@ -88,29 +88,61 @@ class Model:
             
             
             
-    @staticmethod
     def _validate_training_args(
+        self,
         max_epochs,
         saveModelEvery,
         write_losses,
         folder_temp,
+        patience,
     ):
+        errors = []
         if (
             isinstance(max_epochs, bool)
             or not isinstance(max_epochs, (int, np.integer))
             or max_epochs <= 0
         ):
-            raise ValueError(
-                "max_epochs must be a positive finite integer."
+            errors.append("max_epochs must be a positive finite integer.")
+
+        for name, value in (("patience", patience), ("saveModelEvery", saveModelEvery)):
+            positive_integer = (
+                not isinstance(value, bool)
+                and isinstance(value, (int, np.integer))
+                and value > 0
             )
+            positive_infinity = (
+                isinstance(value, (float, np.floating)) and value == torch.inf
+            )
+            if not (positive_integer or positive_infinity):
+                errors.append(f"{name} must be a positive integer or positive infinity.")
+
+        if self.optimizer is None:
+            errors.append("Optimizer must be set before training; call set_optimizer().")
 
         if (
             (saveModelEvery != torch.inf or write_losses)
             and folder_temp is None
         ):
-            raise ValueError(
+            errors.append(
                 "folder_temp must be set when saving "
                 "checkpoints or losses."
+            )
+
+        invalid = torch.tensor(bool(errors), device=self.device, dtype=torch.int32)
+        if self.ddp:
+            dist.all_reduce(invalid, op=ReduceOp.MAX)
+        if invalid.item():
+            raise ValueError(
+                " ".join(errors) if errors else "Invalid training setup on another DDP rank."
+            )
+
+    @staticmethod
+    def _require_finite_loss(loss, context):
+        """Check a scalar epoch loss after its existing DDP reduction/broadcast."""
+        if not torch.isfinite(loss).item():
+            raise FloatingPointError(
+                f"Nonfinite {context} (NaN or Inf) on this or another DDP rank. "
+                "Training aborted; check the inputs, loss function and model stability."
             )
             
 
@@ -135,6 +167,7 @@ class Model:
             dist.all_reduce(totals, op=ReduceOp.SUM)
         if totals[1].item() == 0:
             raise ValueError("train_dataloader is empty.")
+        self._require_finite_loss(totals[0], "training epoch loss")
         return (totals[0] / totals[1]).item()
 
 
@@ -361,8 +394,10 @@ class Model:
             final_model_name (str, optional): Path to save the final best model after training. If None, the model is not saved at the end. Defaults to None.
             verbose (bool, optional): Whether to print progress and status messages during training. Defaults to True.
         Raises:
-            ValueError: If saveModelEvery is not torch.inf and folder_temp is not provided.
-            ValueError: If both max_epochs and patience are set to torch.inf.
+            ValueError: If max_epochs is not a positive finite integer, patience
+                or saveModelEvery is not a positive integer or positive infinity,
+                the optimizer is unset, or saving is enabled without folder_temp.
+            FloatingPointError: If a training or validation loss is NaN or Inf.
         Side Effects:
             - self.losses retains rank-local batch losses; self.lossesEpoch
               contains sample-weighted global training means. self.lossesTest
@@ -381,6 +416,7 @@ class Model:
             saveModelEvery,
             write_losses,
             folder_temp,
+            patience,
         )
                 
         
@@ -612,6 +648,10 @@ class Model:
             validation_loss = validation_loss_tensor.item()
 
         self.lossesTest[epoch] = validation_loss
+        # Check after broadcast and history conversion so every rank fails together.
+        self._require_finite_loss(
+            self.lossesTest[epoch], "validation loss"
+        )
 
 
 
@@ -677,10 +717,10 @@ class Model:
             validation_loss = validation_loss_tensor.item()
 
         self.lossesTest[epoch] = validation_loss
-
-
-
-     
+        # Rank 0 has already broadcast the result to every training rank.
+        self._require_finite_loss(
+            self.lossesTest[epoch], "validation loss"
+        )
         
 
 
@@ -726,8 +766,10 @@ class Model:
             final_model_name (str, optional): Path to save the final best model after training. If None, the model is not saved at the end. Defaults to None.
             verbose (bool, optional): Whether to print progress and status messages during training. Defaults to True.
         Raises:
-            ValueError: If saveModelEvery is not torch.inf and folder_temp is not provided.
-            ValueError: If both max_epochs and patience are set to torch.inf.
+            ValueError: If max_epochs is not a positive finite integer, patience
+                or saveModelEvery is not a positive integer or positive infinity,
+                the optimizer is unset, or saving is enabled without folder_temp.
+            FloatingPointError: If a training or validation loss is NaN or Inf.
         Side Effects:
             - self.losses retains rank-local batch losses; self.lossesEpoch
               contains sample-weighted global training means. self.lossesTest
@@ -747,6 +789,7 @@ class Model:
             saveModelEvery,
             write_losses,
             folder_temp,
+            patience,
         )
         
         

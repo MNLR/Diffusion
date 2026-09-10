@@ -380,6 +380,67 @@ if is_main_process:
     model_pr.load_state_dict(final_model_name)
 
 
+    # Save the deterministic prediction for the complete test period.
+    # Write batches directly to disk to avoid holding the full prediction in RAM.
+    xx2d_test = torch.from_numpy(
+        np.load(datafolder + "x2d_test.npy")
+    ).to(dtype=torch.float32)
+    xx1d_test = torch.from_numpy(
+        np.load(datafolder + "x1d_test.npy")
+    ).to(dtype=torch.float32)
+
+    deterministic_test_dataloader = DataLoader(
+        TensorDataset(xx2d_test, xx1d_test),
+        batch_size=256,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=True,
+    )
+
+    simulations_folder = os.path.join("final_models", model_name, "simulations")
+    os.makedirs(simulations_folder, exist_ok=True)
+    prediction_ev_path = os.path.join(simulations_folder, "prediction_ev.npy")
+
+    prediction_ev_file = None
+    prediction_offset = 0
+
+    for x2d_batch, x1d_batch in deterministic_test_dataloader:
+        x2d_batch = xxPrTransforms.transform(x2d_batch)
+        x1d_batch = xx1DPrTransforms.transform(x1d_batch)
+
+        prediction_batch = model_pr.predict(x2d_batch, x_1D=x1d_batch)
+        prediction_batch = yy_pr_Transform.inverse(prediction_batch)
+
+        if prediction_batch.ndim != 4 or prediction_batch.shape[1] != 1:
+            raise ValueError(
+                "The ASYM model must produce predictions with shape "
+                "(batch, 1, height, width)."
+            )
+
+        prediction_batch = prediction_batch[:, 0, ...].cpu().numpy()
+
+        if prediction_ev_file is None:
+            prediction_ev_file = np.lib.format.open_memmap(
+                prediction_ev_path,
+                mode="w+",
+                dtype=prediction_batch.dtype,
+                shape=(len(deterministic_test_dataloader.dataset),)
+                + prediction_batch.shape[1:],
+            )
+
+        next_prediction_offset = prediction_offset + prediction_batch.shape[0]
+        prediction_ev_file[prediction_offset:next_prediction_offset] = prediction_batch
+        prediction_offset = next_prediction_offset
+
+    if prediction_ev_file is None:
+        raise ValueError("The test dataset is empty; prediction_ev.npy was not created.")
+
+    prediction_ev_file.flush()
+    del prediction_ev_file
+
+    print(f"Deterministic test prediction saved to {prediction_ev_path}", flush=True)
+
+
     # Recreate the same early-stop split used above
     torch.manual_seed(seed)
     np.random.seed(seed)

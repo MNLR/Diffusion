@@ -1,5 +1,19 @@
-MODEL_CONFIG_FILE = "CFG_BernoulliGammaUNET"  # Common to all experiments and domains.
-DATA_TRANSFORMS_FILE = "CFGD_StandardTransforms4Prediction_incX1D" 
+import sys
+
+
+MODEL_CONFIG_FILE = (
+    sys.argv[1] if len(sys.argv) > 1 else "CFG_BernoulliGammaUNET"
+)
+DATA_TRANSFORMS_FILE = (
+    sys.argv[2]
+    if len(sys.argv) > 2
+    else "CFGD_StandardTransforms4Prediction_incX1D"
+)
+
+print("MODEL_CONFIG_FILE =", MODEL_CONFIG_FILE)
+print("DATA_TRANSFORMS_FILE =", DATA_TRANSFORMS_FILE)
+
+
 hash_cfg = True
 save_cfg_to_final = True
 stats_for_n_validation_samples = 100000 # All the validation period 
@@ -15,7 +29,6 @@ datafolder = "data/"
 
 import os
 import importlib
-from pyexpat import model
 import numpy as np
 import torch
 import torch.distributed as dist

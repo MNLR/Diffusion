@@ -1,5 +1,19 @@
-MODEL_CONFIG_FILE = "CFG_BernoulliGammaUNET"  # Common to all experiments and domains.
-DATA_TRANSFORMS_FILE = "CFGD_StandardTransforms4Prediction_incX1D" 
+import sys
+
+
+MODEL_CONFIG_FILE = (
+    sys.argv[1] if len(sys.argv) > 1 else "CFG_BernoulliGammaUNET"
+)
+DATA_TRANSFORMS_FILE = (
+    sys.argv[2]
+    if len(sys.argv) > 2
+    else "CFGD_StandardTransforms4Prediction_incX1D"
+)
+
+print("MODEL_CONFIG_FILE =", MODEL_CONFIG_FILE)
+print("DATA_TRANSFORMS_FILE =", DATA_TRANSFORMS_FILE)
+
+
 hash_cfg = True
 folder_simulations = "final_models"
 max_number_of_simulations = 50  
@@ -13,8 +27,7 @@ import importlib
 from functions.simulateBernoulliGamma import simulate_bernoulli_gamma
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
+from torch.utils.data import DataLoader, TensorDataset
 
 from models.DDPModel import Model
 
@@ -192,12 +205,6 @@ if save_prediction_as_diffusion_background:
 # --------------------------
 # Simulate
 # --------------------------
-folder_simulations = os.path.join(folder_simulations, "simulations")
-os.makedirs(folder_simulations, exist_ok=True)
-
-
-
-
 
 for sim_name in range(50):
     simulation = simulate_bernoulli_gamma(p = prediction[:, 0, ...],
@@ -225,3 +232,7 @@ np.save(folder_simulations + "/simulations_days.npy", simulations_targets)
 
 
 
+prediction_ev = prediction[:, 0, ...] * (
+    1 + prediction[:, 1, ...] / prediction[:, 2, ...]
+)
+np.save(folder_simulations + "/prediction_ev.npy", prediction_ev.cpu().numpy())

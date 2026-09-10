@@ -273,9 +273,17 @@ class Model:
 
     
     def scheduler_step(self, loss, verbose = True):
+        """Step once per epoch; only ReduceLROnPlateau consumes the loss.
+
+        Other schedulers must support epoch-level stepping. Batch-level
+        schedules such as OneCycleLR are not handled by this training loop.
+        """
         if (self.scheduler is not None):
             last_lr = self.scheduler.get_last_lr()
-            self.scheduler.step(loss)
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                self.scheduler.step(loss)
+            else:
+                self.scheduler.step()
             if verbose and self.is_main_process:
                 if last_lr != self.scheduler.get_last_lr():
                     print(f"Scheduler changed LR from {last_lr} to {self.scheduler.get_last_lr()}")

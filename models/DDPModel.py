@@ -425,7 +425,7 @@ class Model:
             max_epochs (int, optional): Maximum number of epochs to train. Defaults to 1000.
             patience (int, optional): Number of epochs without improvement in the monitored loss before stopping. Defaults to 50.
             saveModelEvery (int or float, optional): Frequency (in epochs) to save model checkpoints. If set to torch.inf, disables periodic saving. Defaults to torch.inf.
-            write_losses (bool, optional): Whether to save the training and validation loss arrays to disk after each epoch. Defaults to False.
+            write_losses (bool, optional): Whether to save completed epochs of the training and validation loss histories after each epoch. Defaults to False.
             folder_temp (str, optional): Directory to save model checkpoints and loss arrays. Required when periodic checkpoints or loss writing are enabled.
             final_model_name (str, optional): Path to save the final best model after training. If None, the model is not saved at the end. Defaults to None.
             verbose (bool, optional): Whether to print progress and status messages during training. Defaults to True.
@@ -576,11 +576,11 @@ class Model:
                                     verbose = verbose)
 
             if write_losses and self.is_main_process:
-                np.save(folder_temp + "/losses.npy", self.losses.to("cpu").numpy())
-                np.save(folder_temp + "/lossesEpoch.npy", self.lossesEpoch.numpy())
+                np.save(folder_temp + "/losses.npy", self.losses[:, :epoch + 1].cpu().numpy())
+                np.save(folder_temp + "/lossesEpoch.npy", self.lossesEpoch[:epoch + 1].cpu().numpy())
                 
                 if earlyStop_dataloader is not None:
-                    np.save(folder_temp + "/lossesTest.npy", self.lossesTest.to("cpu").numpy()) 
+                    np.save(folder_temp + "/lossesTest.npy", self.lossesTest[:epoch + 1].cpu().numpy())
                 
                 
                 
@@ -774,7 +774,7 @@ class Model:
             max_epochs (int, optional): Maximum number of epochs to train. Defaults to 1000.
             patience (int, optional): Number of epochs without improvement in the monitored loss before stopping. Defaults to 50.
             saveModelEvery (int or float, optional): Frequency (in epochs) to save model checkpoints. If set to torch.inf, disables periodic saving. Defaults to torch.inf.
-            write_losses (bool, optional): Whether to save the training and validation loss arrays to disk after each epoch. Defaults to False.
+            write_losses (bool, optional): Whether to save completed epochs of the training and validation loss histories after each epoch. Defaults to False.
             folder_temp (str, optional): Directory to save model checkpoints and loss arrays. Required when periodic checkpoints or loss writing are enabled.
             final_model_name (str, optional): Path to save the final best model after training. If None, the model is not saved at the end. Defaults to None.
             verbose (bool, optional): Whether to print progress and status messages during training. Defaults to True.
@@ -939,10 +939,10 @@ class Model:
                                     verbose = verbose)
 
             if write_losses and self.is_main_process:
-                np.save(folder_temp + "/losses.npy", self.losses.to("cpu").numpy())
-                np.save(folder_temp + "/lossesEpoch.npy", self.lossesEpoch.numpy())
+                np.save(folder_temp + "/losses.npy", self.losses[:, :epoch + 1].cpu().numpy())
+                np.save(folder_temp + "/lossesEpoch.npy", self.lossesEpoch[:epoch + 1].cpu().numpy())
                 if earlyStop_dataloader is not None:
-                    np.save(folder_temp + "/lossesTest.npy", self.lossesTest.numpy())
+                    np.save(folder_temp + "/lossesTest.npy", self.lossesTest[:epoch + 1].cpu().numpy())
                 
                 
                 

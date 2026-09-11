@@ -339,8 +339,7 @@ class Model:
         self._load_model_state_dict(loaded_state_dict)
         self.bestmodelStateDict = deepcopy(self._model_module().state_dict())
             
-        if last_loss is not None:
-            self.bestLoss = last_loss            
+        self.bestLoss = torch.inf if last_loss is None else last_loss
             
         self.trained = True
         
@@ -1008,6 +1007,8 @@ class Model:
         for thingys in dataloader: # to get sample shape
             sample = thingys[0]
             break
+        else:
+            raise ValueError("Simulation dataloader is empty.")
         
         if len(thingys) == 3:
             has_indexing = True

@@ -88,6 +88,43 @@ class Model:
             
             
             
+    def _print_training_status(
+        self, stage, *, verbose=True, epoch=None, max_epochs=None,
+        elapsed_time=None, patience_counter=None, patience=None,
+    ):
+        """Print shared training messages on the main process when enabled."""
+        if not verbose or not self.is_main_process:
+            return
+
+        if stage == "resume":
+            print("Model has already been trained or loaded.")
+            print("Restarting training and validation loss histories.")
+            print(f"Last recorded bestLoss: {self.bestLoss}")
+        elif stage == "start":
+            print(f"Starting training on {self.device} with {self.world_size} processes.")
+            if self.ddp:
+                print("DDP is enabled")
+        elif stage == "epoch":
+            print("\n-----------------")
+            print(
+                f"Device {self.device}, Epoch: {epoch}/{max_epochs} "
+                f"@ {datetime.datetime.now()} (+{elapsed_time}s)"
+            )
+            print(f"Current learning rate is: {self.optimizer.param_groups[0]['lr']}")
+            if epoch > 0:
+                print(f"Train Loss: {self.lossesEpoch[epoch - 1]}")
+                if self.lossesTest is not None:
+                    print(f"Validation current loss: {self.lossesTest[epoch - 1]}")
+                print(f"Best loss: {self.bestLoss}")
+        elif stage == "patience":
+            print(f"Device {self.device}, Patience: {patience_counter}/{patience}")
+        elif stage == "end":
+            print(f"\nTraining finished after {epoch} epochs.")
+            print(f"Total training time: {datetime.timedelta(seconds=elapsed_time)}")
+            print(f"Average time per epoch: {elapsed_time / epoch}")
+            dataset = "validation" if self.lossesTest is not None else "training"
+            print(f"Best loss (on {dataset} set): {self.bestLoss}")
+
     def _validate_training_args(
         self,
         max_epochs,
@@ -189,7 +226,7 @@ class Model:
         
         
         
-    def train_iter(self, x, y, loss_function, **forward_kwargs) -> torch.Tensor:
+    def train_iter(self, x, y, loss_function, **forward_kwargs) -> float:
 
         training_mode = self.model.training
         if not training_mode:
@@ -229,7 +266,7 @@ class Model:
         loss_function,
         verbose=True,
         **forward_kwargs,
-    ) -> torch.Tensor:
+    ) -> float:
         training_mode = model.training
         if training_mode:
             model.eval()
@@ -246,8 +283,8 @@ class Model:
             output = model(x, **forward_kwargs)
             loss = loss_function(y, output)
                                 
-        if verbose:
-            print(f"Loss Test (acc): {loss}")                                
+        if verbose and self.is_main_process:
+            print(f"Test loss: {loss}")
             
             
         model.train(mode=training_mode)
@@ -257,7 +294,7 @@ class Model:
 
 
     def test_iter(self, x, y, loss_function,
-                  verbose = True, **forward_kwargs) -> torch.Tensor:
+                  verbose = True, **forward_kwargs) -> float:
         return self._test_iter_with_model(
             self.model,
             x,
@@ -375,7 +412,7 @@ class Model:
         Trains the model using the provided training and early stopping dataloaders, with support for early stopping, 
         learning rate scheduling, and periodic model checkpointing.
         Args:
-            my_loss (callable): Scalar batch-mean loss_function(y, output).
+            my_loss_function (callable): Scalar batch-mean loss_function(y, output).
                 Epoch metrics weight each batch by its sample count.
                 Sum-reduced or variable-denominator masked losses must be
                 normalized to a per-sample mean by the caller.
@@ -384,12 +421,12 @@ class Model:
                 - [-1]: target tensor (e.g. labels or ground truth)
                 - Additional tensors can be passed to the model's forward pass, will use **forward_kwargs.
             earlyStop_dataloader (torch.utils.data.DataLoader): DataLoader for the validation dataset used for early stopping. Format is the same as train_dataloader.
-            If set to None, no early stopping is performed.
+                If None, training loss drives early stopping and scheduling.
             max_epochs (int, optional): Maximum number of epochs to train. Defaults to 1000.
-            patience (int, optional): Number of epochs to wait for improvement in validation loss before stopping early. Defaults to 50.
+            patience (int, optional): Number of epochs without improvement in the monitored loss before stopping. Defaults to 50.
             saveModelEvery (int or float, optional): Frequency (in epochs) to save model checkpoints. If set to torch.inf, disables periodic saving. Defaults to torch.inf.
             write_losses (bool, optional): Whether to save the training and validation loss arrays to disk after each epoch. Defaults to False.
-            folder_temp (str, optional): Directory to save model checkpoints and loss arrays. Required if saveModelEvery is not torch.inf.
+            folder_temp (str, optional): Directory to save model checkpoints and loss arrays. Required when periodic checkpoints or loss writing are enabled.
             final_model_name (str, optional): Path to save the final best model after training. If None, the model is not saved at the end. Defaults to None.
             verbose (bool, optional): Whether to print progress and status messages during training. Defaults to True.
         Raises:
@@ -402,7 +439,9 @@ class Model:
               contains sample-weighted global training means. self.lossesTest
               contains sample-weighted validation means from rank 0's loader.
               DDP validation requires the full, unsharded validation loader.
-            - Updates self.bestLoss and self.bestmodelStateDict with the best validation loss and corresponding model parameters.
+            - Updates self.bestLoss and self.bestmodelStateDict using validation loss,
+              or training loss when no validation loader is supplied.
+            - Restores the best weights in memory at the end of training.
             - Saves model checkpoints and loss arrays to disk if enabled.
             - Prints progress and status messages if verbose is True.
             - sets self.trained to True, indicating the model has been trained.            
@@ -420,12 +459,7 @@ class Model:
                 
         
         if self.trained:
-            if verbose and self.is_main_process:
-                print("Model has already been trained or loaded.")
-                if self.losses == None:
-                    print("Restarting losses and lossesTest tensors.")
-                        
-                print("Last recorded bestLoss: " + str(self.bestLoss))
+            self._print_training_status("resume", verbose=verbose)
             
             if self.bestLoss is None:
                 self.bestLoss = torch.inf
@@ -445,10 +479,7 @@ class Model:
 
 
         
-        if verbose and self.is_main_process:
-            print("Starting training on " + str(self.device) + " with " + str(self.world_size) + " processes.")
-            if self.ddp:
-                print("DDP is enabled")
+        self._print_training_status("start", verbose=verbose)
             
             
             
@@ -459,19 +490,11 @@ class Model:
 
         while (epoch < max_epochs) and (patienceCounter < patience):
             
+            self._print_training_status(
+                "epoch", verbose=verbose, epoch=epoch, max_epochs=max_epochs,
+                elapsed_time=elapsedTime,
+            )
             if verbose and self.is_main_process:
-                print("\n-----------------")
-                
-
-                print("GPU " + str(self.device) + ", Epoch: " + str(epoch) + "/" + str(max_epochs) + " @ " + str(datetime.datetime.now()) + "(+" + str(elapsedTime) + "s)")
-                print("Current learning rate is: " + str(self.optimizer.param_groups[0]['lr']))
-                if epoch > 0:
-                    print(f"Train Loss: {self.lossesEpoch[epoch-1]}")
-                    if earlyStop_dataloader is not None:
-                        print(f"Validation current loss: {self.lossesTest[epoch-1]} / Best loss : {self.bestLoss}")
-                    else:
-                        print(f"Current loss: {self.lossesEpoch[epoch-1]} / Best loss : {self.bestLoss}")
-                        
                 start = time.time()
                 
             
@@ -486,13 +509,10 @@ class Model:
             
             progress_bar = tqdm(
                 train_dataloader,
-                disable=not self.is_main_process,
+                desc=f"Epoch {epoch} on {self.device}",
+                disable=not (verbose and self.is_main_process),
             )
             for batch in progress_bar:
-                if self.ddp:      
-                    progress_bar.set_description(f"Running epoch {epoch} on {self.world_size} GPUs")
-                else:
-                    progress_bar.set_description(f"Running epoch {epoch} on device " + str(self.device))
 
 
                 x = batch[0]
@@ -527,7 +547,7 @@ class Model:
             
                 
             if not (self.scheduler is None):
-                self.scheduler_step(loss_to_account)
+                self.scheduler_step(loss_to_account, verbose=verbose)
 
 
 
@@ -540,10 +560,12 @@ class Model:
             self.updateBestModelandLoss(loss_to_account) # already checks if loss is better than bestLoss and updates bestLoss
 
 
+            self._print_training_status(
+                "patience", verbose=verbose, patience_counter=patienceCounter,
+                patience=patience,
+            )
             if verbose and self.is_main_process:
-                # print("Patience: " + str(patienceCounter) + "/" + str(patience))
-                print("GPU " + str(self.device) + ", Patience: " + str(patienceCounter) + "/" + str(patience))
-                elapsedTime = time.time() - start 
+                elapsedTime = time.time() - start
                 sumTime += elapsedTime
 
 
@@ -578,17 +600,9 @@ class Model:
         
         
         
-        if verbose and self.is_main_process:
-            print("\n \n")
-            print("Training finished after " + str(epoch) + " epochs.")
-            print("Total training time: " + str(datetime.timedelta(seconds = sumTime)))
-            print("Average time per epoch: " + str(sumTime / epoch))
-            if earlyStop_dataloader is None:
-                add_string = " (on training set): "
-            else:    
-                add_string = " (on validation set): "
-
-            print("Best loss" + add_string  + str(self.bestLoss))
+        self._print_training_status(
+            "end", verbose=verbose, epoch=epoch, elapsed_time=sumTime
+        )
         
         
         
@@ -741,27 +755,27 @@ class Model:
         """
         Trains the model for diffusion tasks using the provided training dataloader and noise scheduler, 
         with support for early stopping, learning rate scheduling, and periodic model checkpointing.
-        This model is meant to be used with conditional diffusion models,
-            where the input is a noisy image and the target is the clean image.
-
-        Differences from trainModel:
-            - Designed for diffusion models, expects batches where the first channel is the target (clean images)
-              and the remaining channels are conditioning information.
-            - Requires a noise_scheduler to generate noisy images and timesteps.
-            - Uses MSE loss between predicted and true noise. This is hardcoded since diffusion models work with MSE
+        The model predicts the sampled noise from a noisy image and conditioning.
+        Each batch contains two tensors: clean images and conditioning.
+        The scheduler corrupts clean images at randomly sampled timesteps;
+        my_loss_function compares predicted and sampled noise (MSE by default).
             
         Args:
             train_dataloader (torch.utils.data.DataLoader): DataLoader for the training dataset. Must contain two tensors in each batch:
                 - [0]: target (clean images)
                 - [1]: conditioning            
+            noise_scheduler: Scheduler used to corrupt clean images at sampled timesteps.
+            earlyStop_dataloader (torch.utils.data.DataLoader, optional): Full validation
+                loader with the same batch format. If None, training loss drives
+                early stopping and scheduling.
             my_loss_function (callable): Scalar batch-mean loss. Epoch metrics
                 weight batches by sample count; sum-reduced or variable-denominator
                 masked losses require caller normalization to a per-sample mean.
             max_epochs (int, optional): Maximum number of epochs to train. Defaults to 1000.
-            patience (int, optional): Number of epochs to wait for improvement in validation loss before stopping early. Defaults to 50.
+            patience (int, optional): Number of epochs without improvement in the monitored loss before stopping. Defaults to 50.
             saveModelEvery (int or float, optional): Frequency (in epochs) to save model checkpoints. If set to torch.inf, disables periodic saving. Defaults to torch.inf.
             write_losses (bool, optional): Whether to save the training and validation loss arrays to disk after each epoch. Defaults to False.
-            folder_temp (str, optional): Directory to save model checkpoints and loss arrays. Required if saveModelEvery is not torch.inf.
+            folder_temp (str, optional): Directory to save model checkpoints and loss arrays. Required when periodic checkpoints or loss writing are enabled.
             final_model_name (str, optional): Path to save the final best model after training. If None, the model is not saved at the end. Defaults to None.
             verbose (bool, optional): Whether to print progress and status messages during training. Defaults to True.
         Raises:
@@ -774,7 +788,9 @@ class Model:
               contains sample-weighted global training means. self.lossesTest
               contains sample-weighted validation means from rank 0's loader.
               DDP validation requires the full, unsharded validation loader.
-            - Updates self.bestLoss and self.bestmodelStateDict with the best validation loss and corresponding model parameters.
+            - Updates self.bestLoss and self.bestmodelStateDict using validation loss,
+              or training loss when no validation loader is supplied.
+            - Restores the best weights in memory at the end of training.
             - Saves model checkpoints and loss arrays to disk if enabled.
             - Prints progress and status messages if verbose is True.
             - sets self.trained to True, indicating the model has been trained.
@@ -794,12 +810,7 @@ class Model:
         
         
         if self.trained:
-            if verbose and self.is_main_process:
-                print("Model has already been trained or loaded.")
-                if self.losses == None:
-                    print("Restarting losses and lossesTest tensors.")
-                        
-                print("Last recorded bestLoss: " + str(self.bestLoss))
+            self._print_training_status("resume", verbose=verbose)
 
             if self.bestLoss is None:
                 self.bestLoss = torch.inf
@@ -820,10 +831,7 @@ class Model:
             
             
             
-        if verbose and self.is_main_process:
-            print("Starting training on " + str(self.device) + " with " + str(self.world_size) + " processes.")
-            if self.ddp:
-                print("DDP is enabled")
+        self._print_training_status("start", verbose=verbose)
             
             
             
@@ -834,18 +842,11 @@ class Model:
 
         while (epoch < max_epochs) and (patienceCounter < patience):
             
+            self._print_training_status(
+                "epoch", verbose=verbose, epoch=epoch, max_epochs=max_epochs,
+                elapsed_time=elapsedTime,
+            )
             if verbose and self.is_main_process:
-                print("\n-----------------")
-                
-
-                print("GPU " + str(self.device) + ", Epoch: " + str(epoch) + "/" + str(max_epochs) + " @ " + str(datetime.datetime.now()) + "(+" + str(elapsedTime) + "s)")
-                print("Current learning rate is: " + str(self.optimizer.param_groups[0]['lr']))
-                if epoch > 0:
-                    if earlyStop_dataloader is not None:
-                        print(f"Train Loss: {self.lossesEpoch[epoch-1]}")
-                        print(f"Validation current loss: {self.lossesTest[epoch-1]} / Best loss : {self.bestLoss}")
-                    else:
-                        print(f"Train current loss: {self.lossesEpoch[epoch-1]} / Best loss: {self.bestLoss}")
                 start = time.time()
                 
 
@@ -860,7 +861,8 @@ class Model:
             epoch_sample_count = 0
             progress_bar = tqdm(
                 train_dataloader,
-                disable=not self.is_main_process,
+                desc=f"Epoch {epoch} on {self.device}",
+                disable=not (verbose and self.is_main_process),
             )
             for clean_images, condition in progress_bar:          
 
@@ -891,10 +893,8 @@ class Model:
                 epoch_loss_sum += loss * clean_images.shape[0]
                 epoch_sample_count += clean_images.shape[0]
 
-                if self.ddp:      
-                    progress_bar.set_description(f"Running epoch {epoch} on {self.world_size} GPUs. Current Loss: {self.losses[batch_i, epoch]}")
-                else:
-                    progress_bar.set_description(f"Running epoch {epoch} on device " + str(self.device))
+                if verbose and self.is_main_process:
+                    progress_bar.set_postfix(loss=loss)
 
                                 
                 batch_i += 1
@@ -911,7 +911,7 @@ class Model:
             
 
             if not (self.scheduler is None):
-                self.scheduler_step(loss_to_account)
+                self.scheduler_step(loss_to_account, verbose=verbose)
 
 
             if (loss_to_account < self.bestLoss):        
@@ -923,10 +923,12 @@ class Model:
             self.updateBestModelandLoss(loss_to_account) # already checks if loss is better than bestLoss and updates bestLoss
 
 
+            self._print_training_status(
+                "patience", verbose=verbose, patience_counter=patienceCounter,
+                patience=patience,
+            )
             if verbose and self.is_main_process:
-                # print("Patience: " + str(patienceCounter) + "/" + str(patience))
-                print("GPU " + str(self.device) + ", Patience: " + str(patienceCounter) + "/" + str(patience))
-                elapsedTime = time.time() - start 
+                elapsedTime = time.time() - start
                 sumTime += elapsedTime
 
 
@@ -958,17 +960,9 @@ class Model:
                 
         
         
-        if verbose and self.is_main_process:
-            print("\n \n")
-            print("Training finished after " + str(epoch) + " epochs.")
-            print("Total training time: " + str(datetime.timedelta(seconds = sumTime)))
-            print("Average time per epoch: " + str(sumTime / epoch))
-            
-            if earlyStop_dataloader is not None:
-                add_string = " (on validation set): "
-            else:   
-                add_string = " (on training set): "
-            print("Best loss" + add_string  + str(self.bestLoss))
+        self._print_training_status(
+            "end", verbose=verbose, epoch=epoch, elapsed_time=sumTime
+        )
             
 
         
@@ -985,9 +979,10 @@ class Model:
                           verbose = True, **step_kwargs):
         """
         Simulates the diffusion process over a dataset using a noise scheduler and saves or returns the results.
-        Note: If launched on parallel, this method requires backend = "gloo", since it pushes the results to cpus
+        Distributed sampling gathers CPU outputs and requires a Gloo process group.
         Args:
-            dataloader (torch.utils.data.DataLoader): DataLoader providing (sample, conditioning) pairs for simulation.
+            dataloader (torch.utils.data.DataLoader): Provides (sample, conditioning)
+                batches, optionally with a third tensor of sample indices.
                 Assumes sample is pregenerated noise (typically normally distributed noise)
                 Will generate samples based on this
             noise_scheduler: An object that provides the diffusion timesteps and a `step` method to update samples.
@@ -996,10 +991,14 @@ class Model:
             file_name (str, optional): If provided, the simulation results are saved to this file (as a NumPy .npy file).
                                         If None, the simulation results are returned as a NumPy array.
         Returns:
-            np.ndarray or None: The simulated data as a NumPy array if `file_name` is None; otherwise, saves the data to disk and returns None.
+            np.ndarray or None: On rank 0, returns the array if file_name is None,
+                otherwise saves it and returns None. Other ranks return None.
+        Raises:
+            ValueError: If the simulation dataloader is empty.
         Notes:
-            - If running in a distributed setting (`self.world_size > 1`), the file name is suffixed with the device rank.
-            - The method assumes that `self.predict` and `noise_scheduler.step` are implemented and compatible with the data shapes.
+            - Rank 0 gathers distributed outputs and writes the supplied file name.
+              When indices are supplied, it sorts and removes duplicate samples.
+            - Calls the model directly during denoising; predict() is not used.
             - The simulation is performed by iteratively applying the model's prediction and the noise scheduler's step for each timestep.
         """
         
@@ -1014,7 +1013,7 @@ class Model:
             has_indexing = True
         else:
             has_indexing = False
-            if self.world_size > 1:
+            if verbose and self.is_main_process and self.world_size > 1:
                 print("Warning: no index was found and this seems to be a distributed simulation. It will not be possible to remove potential duplicates and beware of the order.")
         
         
@@ -1034,7 +1033,7 @@ class Model:
             if verbose: 
                 progress_bar = tqdm(
                     dataloader,
-                    disable=not self.is_main_process,
+                    disable=not (verbose and self.is_main_process),
                 )
             else:
                 progress_bar = dataloader
@@ -1045,9 +1044,10 @@ class Model:
 
 
 
-        simulation = torch.zeros((0, *sample.shape[1:]))
+        # Keep the empty tensors to preserve the existing dtype promotion.
+        simulation_batches = [torch.zeros((0, *sample.shape[1:]))]
         if has_indexing:
-            index = torch.zeros((0))                                     
+            index_batches = [torch.zeros((0))]
         for thingys in progress_bar:
             
 
@@ -1059,7 +1059,7 @@ class Model:
                     sub_dataloader = tqdm(torch.utils.data.DataLoader( torch.utils.data.TensorDataset(sample, conditioning),
                                                                     batch_size = sub_batch_size,
                                                                     shuffle = False), 
-                                        disable=not self.is_main_process
+                                        disable=not (verbose and self.is_main_process)
                                         )
                 else:
                     sub_dataloader = torch.utils.data.DataLoader( torch.utils.data.TensorDataset(sample, conditioning),
@@ -1102,15 +1102,21 @@ class Model:
 
                         sample = noise_scheduler.step(model_output = residual, timestep = timestep_, sample = sample, **step_kwargs).prev_sample
                             
-                    simulation = torch.concatenate((simulation, sample.cpu()), dim=0)
+                    simulation_batches.append(sample.cpu())
 
             self.model.train(mode=training_mode)
 
             if has_indexing:
-                index = torch.concatenate((index, thingys[2]))
+                index_batches.append(thingys[2])
                 
             
         
+        simulation = torch.cat(simulation_batches, dim=0)
+        del simulation_batches
+        if has_indexing:
+            index = torch.cat(index_batches, dim=0)
+            del index_batches
+
         if self.world_size > 1:
             # Gather the simulation results from all devices
             # Note: This assumes that the simulation is on the CPU, so necessitates backend = "gloo"

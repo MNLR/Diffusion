@@ -11,6 +11,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from torch.distributed import ReduceOp, gather
 
+from models.generative.objectives import DiffusionObjective
+
 
 class Model:
     
@@ -669,7 +671,7 @@ class Model:
 
 
 
-    def __validateDiffusion(self, my_loss, earlyStop_dataloader, noise_scheduler, epoch):
+    def __validateDiffusion(self, objective, earlyStop_dataloader, epoch):
         if len(earlyStop_dataloader) == 0:
             raise ValueError("earlyStop_dataloader is empty.")
 
@@ -680,37 +682,16 @@ class Model:
             validation_model = self._model_module()
 
             for clean_images, condition in earlyStop_dataloader:
-                noise = torch.randn(clean_images.shape)
-                timesteps = torch.randint(
-                    low=0,
-                    high=noise_scheduler.config['num_train_timesteps'],
-                    size=(clean_images.shape[0],),
-                    dtype=torch.long,
+                inputs, target, forward_kwargs = objective.prepare_batch(
+                    clean_images, condition,
                 )
-                noisy_images = noise_scheduler.add_noise(
-                    clean_images,
-                    noise,
-                    timesteps,
-                )
-
-                # Conditional path based on model input
-                if "encoder_hidden_states" in self.additional_forward_args:
-                    noisy_images_and_condition = noisy_images
-                    forward_kwargs = {"encoder_hidden_states": condition}
-                else:
-                    noisy_images_and_condition = torch.cat(
-                        (noisy_images, condition),
-                        dim=1,
-                    )
-                    forward_kwargs = {}
 
                 batch_loss = self._test_iter_with_model(
                     validation_model,
-                    noisy_images_and_condition,
-                    y=noise,
-                    loss_function=my_loss,
+                    inputs,
+                    y=target,
+                    loss_function=objective.compute_loss,
                     verbose=False,
-                    timestep=timesteps,
                     **forward_kwargs,
                 )
 
@@ -759,6 +740,8 @@ class Model:
         Each batch contains two tensors: clean images and conditioning.
         The scheduler corrupts clean images at randomly sampled timesteps;
         my_loss_function compares predicted and sampled noise (MSE by default).
+        One DiffusionObjective shares batch preparation and loss evaluation
+        between training and validation. Optimizer and DDP handling stay here.
             
         Args:
             train_dataloader (torch.utils.data.DataLoader): DataLoader for the training dataset. Must contain two tensors in each batch:
@@ -806,9 +789,15 @@ class Model:
             folder_temp,
             patience,
         )
-        
-        
-        
+
+        objective = DiffusionObjective(
+            noise_scheduler=noise_scheduler,
+            loss_function=my_loss_function,
+            use_encoder_conditioning=(
+                "encoder_hidden_states" in self.additional_forward_args
+            ),
+        )
+
         if self.trained:
             self._print_training_status("resume", verbose=verbose)
 
@@ -865,30 +854,15 @@ class Model:
                 disable=not (verbose and self.is_main_process),
             )
             for clean_images, condition in progress_bar:          
-
-                noise = torch.randn( clean_images.shape )
-
-                timesteps = torch.randint( low = 0, high = noise_scheduler.config['num_train_timesteps'], 
-                        size = (clean_images.shape[0], ), dtype=torch.long)
-            
-                noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-
-                # If model expects encoder_hidden_states (UNet2DConditionModel)
-                # pass condition as a kwarg; otherwise, concatenate
-                if "encoder_hidden_states" in self.additional_forward_args:
-                    noisy_images_and_condition = noisy_images
-                    forward_kwargs = {"encoder_hidden_states": condition}
-                else:
-                    noisy_images_and_condition = torch.cat((noisy_images, condition), dim = 1)
-                    forward_kwargs = {}
-
-                
-                loss = self.train_iter(x = noisy_images_and_condition,
-                                                              y = noise, 
-                                                              timestep = timesteps,
-                                                              loss_function = my_loss_function,
-                                                              **forward_kwargs
-                                                              )
+                inputs, target, forward_kwargs = objective.prepare_batch(
+                    clean_images, condition,
+                )
+                loss = self.train_iter(
+                    x=inputs,
+                    y=target,
+                    loss_function=objective.compute_loss,
+                    **forward_kwargs,
+                )
                 self.losses[batch_i, epoch] = loss
                 epoch_loss_sum += loss * clean_images.shape[0]
                 epoch_sample_count += clean_images.shape[0]
@@ -905,7 +879,7 @@ class Model:
             if earlyStop_dataloader is None:
                 loss_to_account = self.lossesEpoch[epoch]
             else:
-                self.__validateDiffusion(my_loss_function, earlyStop_dataloader, noise_scheduler, epoch) # updates self.lossesTest[epoch]
+                self.__validateDiffusion(objective, earlyStop_dataloader, epoch)
                 loss_to_account = self.lossesTest[epoch]
             
             

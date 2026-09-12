@@ -9,3 +9,10 @@ The script writes some stats after training and plots some maps automatically fr
 It also hashes the folders so there is no overwrite. 
 
 All the data necessary to reproduce the results in Legasa et al. (2026) can be found on Zenodo: https://doi.org/10.5281/zenodo.20610814.
+
+## Generative components
+
+The [generative components](models/generative/README.md) contain the existing
+diffusion objective shared by training and validation. Process, network-adapter
+and sampler modules remain placeholders. Existing experiment entry points are
+unchanged.
